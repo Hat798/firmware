@@ -341,7 +341,10 @@ void drawMessageScreen(const String &msg, const String &hint, const String &cent
 
     if (centerNote.length() > 0) {
         int aboveFooterY = g.footerY - 4;
-        int noteY = y + max(0, (aboveFooterY - y - g.lineH) / 2);
+        // Biased toward the footer (rather than dead-centered in the gap) so
+        // the note sits a bit further down the screen.
+        int gapSpace = max(0, aboveFooterY - y - g.lineH);
+        int noteY = y + (gapSpace * 2) / 3;
         tft.setTextColor(TFT_YELLOW, bruceConfig.bgColor);
         for (auto &line : wrapText(centerNote, g.maxChars)) {
             int nx = (tftWidth - (int)(line.length() * FP * LW)) / 2;
@@ -539,12 +542,21 @@ StartAction showStartScreen() {
     int cursor = 0;
     const char *labels[2] = {"Start", "Settings"};
     ChatGeometry g = computeGeometry();
-    String instructions = "1. Get a model + tokenizer -\n"
-                          "e.g. stories260K.bin + tok512.bin\n"
-                          "from huggingface.co/karpathy/\n"
-                          "tinyllamas\n"
-                          "2. Copy both to BruceLM/models";
-    std::vector<String> instructionLines = wrapText(instructions, g.maxChars);
+    // Built as explicit (text, indented) rows rather than a single wrapped
+    // string - wrapLine() treats runs of leading spaces as word breaks and
+    // silently eats them, so indentation can't survive a plain "\n"-joined
+    // string round-tripped through wrapText().
+    struct InstructionRow {
+        String text;
+        bool indented;
+    };
+    std::vector<InstructionRow> instructionLines = {
+        {"1. Download a model and tokenizer file.",     false},
+        {"E.g: stories260K.bin and tok512.bin from:",   true },
+        {"https://tinyurl.com/Stories260K",             true },
+        {"2. Copy both files to SD card: BruceLM/models", false},
+    };
+    int indentPx = FP * LW * 3;
 
     int rowH = g.lineH + 6;
     // Centered in the gap between the end of the instructions text and the
@@ -553,20 +565,29 @@ StartAction showStartScreen() {
     int afterTextY = g.outputTop + (int)instructionLines.size() * g.lineH + 4;
     int aboveFooterY = g.footerY - 4;
     int rowsBlockH = rowH * 2;
-    int row1Y = afterTextY + max(0, (aboveFooterY - afterTextY - rowsBlockH) / 2);
+    // Biased toward the footer (rather than dead-centered in the gap) so the
+    // buttons sit a bit further down the screen.
+    int gapSpace = max(0, aboveFooterY - afterTextY - rowsBlockH);
+    int row1Y = afterTextY + (gapSpace * 2) / 3;
     int row2Y = row1Y + rowH;
 
     bool redraw = true;
     for (;;) {
         if (redraw) {
             drawMainBorderWithTitle("BruceLM");
-            tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
             int y = g.outputTop;
-            for (auto &line : instructionLines) {
-                tft.setCursor(BORDER_PAD_X, y);
-                tft.print(line);
+            for (auto &row : instructionLines) {
+                // Dim the URL line to secColor, the same tone used for AI
+                // reply text, so it reads as secondary to the numbered steps.
+                bool isUrlLine = row.text.indexOf("tinyurl.com") >= 0;
+                tft.setTextColor(
+                    isUrlLine ? bruceConfig.secColor : bruceConfig.priColor, bruceConfig.bgColor
+                );
+                tft.setCursor(BORDER_PAD_X + (row.indented ? indentPx : 0), y);
+                tft.print(row.text);
                 y += g.lineH;
             }
+            tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
 
             for (int i = 0; i < 2; i++) {
                 int rowY = (i == 0) ? row1Y : row2Y;
@@ -732,9 +753,7 @@ void bruceLM_setup() {
     if (!showConfirm(
             "Select a model checkpoint file.\n"
             "\n"
-            "Recommended example:\n"
-            "\n"
-            "stories260K.bin",
+            "(e.g. \"stories260K.bin\")",
             "OK: continue   Esc: cancel",
             "Press OK to open the file picker"
         ))
@@ -743,12 +762,10 @@ void bruceLM_setup() {
     if (checkpointPath.length() == 0) return; // user backed out of the picker
 
     if (!showConfirm(
-            "Now select the tokenizer file\n"
-            "that matches your model.\n"
+            "Select the tokenizer file that\n"
+            "matches your model.\n"
             "\n"
-            "Recommended example:\n"
-            "\n"
-            "tok512.bin",
+            "(e.g. \"tok512.bin\")",
             "OK: continue   Esc: cancel",
             "Press OK to open the file picker"
         ))
