@@ -79,20 +79,20 @@ constexpr int kDefaultSeedPresetIndex = kNumSeedPresets - 1; // "Random"
 
 // Every field here is a real, functioning knob on the engine
 // (llm_engine.cpp's generate() / GenerationParams) - nothing decorative.
-// temperature/topP/seed are the same sampling controls run.c itself exposes;
-// repetitionPenalty is a common addition upstream llama2.c doesn't have,
-// included because it measurably helps tiny models avoid repetition loops.
+// Defaults are tuned for a model this small (1M params) rather than copied
+// from typical LLM defaults - see git history/PR for the prompt-comparison
+// data behind the specific values.
+//
 // Wraps prompts as `userTag + prompt + "\n" + botTag` before encoding, so a
 // chat-finetuned model (trained on that exact "<user>: ...\n<bot>: ..." pair
 // format) is cued to answer immediately instead of hallucinating a whole
 // fake turn. On by default to match Chat1M.bin, the default recommended
-// model - plain story models (e.g. stories260K.bin) were never trained on
-// any such template and expect raw text, so turn this off for those.
+// model - plain story models (e.g. stories260K.bin) expect raw text instead.
 struct BruceLMSettings {
-    float temperature = 0.8f;
-    float topP = 0.9f;
-    float repetitionPenalty = 1.0f;
-    int maxTokens = 256;
+    float temperature = 0.5f;
+    float topP = 0.7f;
+    float repetitionPenalty = 1.15f;
+    int maxTokens = 128;
     int seedPresetIndex = kDefaultSeedPresetIndex;
     bool chatTemplateEnabled = true;
     String userTag = "<user>: ";
@@ -487,9 +487,7 @@ void showChatTemplateScreen(BruceLMSettings &s) {
             tft.setTextSize(FP);
             for (int i = 0; i < kNumRows; i++) {
                 int rowY = startY + i * rowH;
-                tft.fillRect(
-                    BORDER_PAD_X, rowY, tftWidth - 2 * BORDER_PAD_X, rowH, bruceConfig.bgColor
-                );
+                tft.fillRect(BORDER_PAD_X, rowY, tftWidth - 2 * BORDER_PAD_X, rowH, bruceConfig.bgColor);
                 tft.setTextColor(cursor == i ? TFT_YELLOW : bruceConfig.priColor, bruceConfig.bgColor);
                 tft.setCursor(BORDER_PAD_X, rowY + 2);
                 tft.print(rows[i].label);
@@ -512,7 +510,9 @@ void showChatTemplateScreen(BruceLMSettings &s) {
             tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
             String hint = "OK: edit  Esc: save+exit";
             int hintTextY = g.footerY + (kFooterH - g.lineH) / 2;
-            tft.fillRect(0, hintTextY - 2, tftWidth, g.lineH + 4, bruceConfig.bgColor);
+            tft.fillRect(
+                BORDER_PAD_X, hintTextY - 2, tftWidth - 2 * BORDER_PAD_X, g.lineH + 4, bruceConfig.bgColor
+            );
             int hx = (tftWidth - (int)(hint.length() * FP * LW)) / 2;
             if (hx < BORDER_PAD_X) hx = BORDER_PAD_X;
             tft.setCursor(hx, hintTextY);
@@ -653,7 +653,9 @@ bool showSettingsScreen(FS &fs) {
             tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
             String hint = edit.editing ? "OK: confirm  Esc: revert" : "OK: edit  Esc: save+exit";
             int hintTextY = g.footerY + (kFooterH - g.lineH) / 2;
-            tft.fillRect(0, hintTextY - 2, tftWidth, g.lineH + 4, bruceConfig.bgColor);
+            tft.fillRect(
+                BORDER_PAD_X, hintTextY - 2, tftWidth - 2 * BORDER_PAD_X, g.lineH + 4, bruceConfig.bgColor
+            );
             int hx = (tftWidth - (int)(hint.length() * FP * LW)) / 2;
             if (hx < BORDER_PAD_X) hx = BORDER_PAD_X;
             tft.setCursor(hx, hintTextY);
@@ -828,24 +830,24 @@ void showHowToRunScreen() {
         bool dimmed;
     };
     std::vector<InfoRow> lines = {
-        {"1. Download zipped model and",                    false, false},
-        {"tokenizer files from:",                           true,  false},
-        {"https://archive.org/details/BruceLM",             true,  true },
-        {"2. Unzip both files to SD card",                  false, false},
-        {"BruceLM/models/:",                                true,  false},
-        {"models/Chat1M/chat1M.bin",                        true,  true },
-        {"models/Chat1M/tok512.bin",                        true,  true },
-        {"models/Stories260K/stories260K.bin",              true,  true },
-        {"models/Stories260K/tok512.bin",                   true,  true },
-        {"3. Turn off chat templates",                       false, false},
-        {"for stories260K",                                  true,  false},
-        {"4. You can create your own models",               false, false},
-        {"using llama2.c by Karpathy",                      true,  false},
+        {"1. Download zipped model and",        false, false},
+        {"tokenizer files from:",               true,  false},
+        {"https://archive.org/details/BruceLM", true,  true },
+        {"2. Unzip both files to SD card",      false, false},
+        {"BruceLM/models/:",                    true,  false},
+        {"models/Chat1M/chat1M.bin",            true,  true },
+        {"models/Chat1M/tok512.bin",            true,  true },
+        {"models/Stories260K/stories260K.bin",  true,  true },
+        {"models/Stories260K/tok512.bin",       true,  true },
+        {"3. Turn off chat templates",          false, false},
+        {"for stories260K",                     true,  false},
+        {"4. You can create your own models",   false, false},
+        {"using llama2.c by Karpathy",          true,  false},
     };
     int indentPx = FP * LW * 3;
     int lineH = g.lineH;
 
-    int okayRowH = lineH + 4; // just tall enough for the label, not a full list row
+    int okayRowH = lineH + 4;             // just tall enough for the label, not a full list row
     int okayY = g.footerY - 4 - okayRowH; // pinned above the footer, independent of content length
 
     // Reserve one row at the top for the scroll-direction indicators, kept
@@ -891,7 +893,10 @@ void showHowToRunScreen() {
                 tft.setCursor(BORDER_PAD_X + (row.indented ? indentPx : 0), y);
                 tft.print(row.text);
                 tft.fillRect(
-                    BORDER_PAD_X, y + lineH / 2, tftWidth - 2 * BORDER_PAD_X, lineH - lineH / 2,
+                    BORDER_PAD_X,
+                    y + lineH / 2,
+                    tftWidth - 2 * BORDER_PAD_X,
+                    lineH - lineH / 2,
                     bruceConfig.bgColor
                 );
             }

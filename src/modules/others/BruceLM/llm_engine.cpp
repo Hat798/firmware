@@ -50,10 +50,9 @@ struct TokenIndex {
 };
 
 int strLookup(const char *str, const std::vector<TokenIndex> &sorted) {
-    auto it = std::lower_bound(
-        sorted.begin(), sorted.end(), str,
-        [](const TokenIndex &a, const char *s) { return strcmp(a.str, s) < 0; }
-    );
+    auto it = std::lower_bound(sorted.begin(), sorted.end(), str, [](const TokenIndex &a, const char *s) {
+        return strcmp(a.str, s) < 0;
+    });
     if (it != sorted.end() && strcmp(it->str, str) == 0) return it->id;
     return -1;
 }
@@ -421,9 +420,11 @@ LLMLoadError LLMEngine::load(
 
     impl->sortedVocab.resize(vocab);
     for (int i = 0; i < vocab; i++) impl->sortedVocab[i] = {impl->vocab[i], i};
-    std::sort(impl->sortedVocab.begin(), impl->sortedVocab.end(), [](const TokenIndex &a, const TokenIndex &b) {
-        return strcmp(a.str, b.str) < 0;
-    });
+    std::sort(
+        impl->sortedVocab.begin(), impl->sortedVocab.end(), [](const TokenIndex &a, const TokenIndex &b) {
+            return strcmp(a.str, b.str) < 0;
+        }
+    );
 
     // run-state buffers (small, fp32, PSRAM)
     impl->x = (float *)psram_alloc(dim * sizeof(float));
