@@ -82,12 +82,20 @@ constexpr int kDefaultSeedPresetIndex = kNumSeedPresets - 1; // "Random"
 // temperature/topP/seed are the same sampling controls run.c itself exposes;
 // repetitionPenalty is a common addition upstream llama2.c doesn't have,
 // included because it measurably helps tiny models avoid repetition loops.
+// Wraps prompts as `userTag + prompt + "\n" + botTag` before encoding, so a
+// chat-finetuned model (trained on that exact "<user>: ...\n<bot>: ..." pair
+// format) is cued to answer immediately instead of hallucinating a whole
+// fake turn. Off by default since plain story models (e.g. stories260K.bin)
+// were never trained on any such template and expect raw text.
 struct BruceLMSettings {
     float temperature = 0.8f;
     float topP = 0.9f;
     float repetitionPenalty = 1.0f;
     int maxTokens = 256;
     int seedPresetIndex = kDefaultSeedPresetIndex;
+    bool chatTemplateEnabled = false;
+    String userTag = "<user>: ";
+    String botTag = "<bot>: ";
 
     uint32_t seed() const { return kSeedPresets[seedPresetIndex].value; }
 };
@@ -107,6 +115,9 @@ BruceLMSettings loadSettings(FS &fs) {
             int idx = doc["seedPresetIndex"];
             if (idx >= 0 && idx < kNumSeedPresets) s.seedPresetIndex = idx;
         }
+        if (!doc["chatTemplateEnabled"].isNull()) s.chatTemplateEnabled = doc["chatTemplateEnabled"];
+        if (!doc["userTag"].isNull()) s.userTag = doc["userTag"].as<String>();
+        if (!doc["botTag"].isNull()) s.botTag = doc["botTag"].as<String>();
     }
     f.close();
     return s;
@@ -119,6 +130,9 @@ void saveSettings(FS &fs, const BruceLMSettings &s) {
     doc["repetitionPenalty"] = s.repetitionPenalty;
     doc["maxTokens"] = s.maxTokens;
     doc["seedPresetIndex"] = s.seedPresetIndex;
+    doc["chatTemplateEnabled"] = s.chatTemplateEnabled;
+    doc["userTag"] = s.userTag;
+    doc["botTag"] = s.botTag;
     File f = fs.open(kConfigPath, FILE_WRITE);
     if (!f) return;
     serializeJsonPretty(doc, f);
@@ -317,8 +331,15 @@ bool renderChat(ChatSession &s, bool force) {
 }
 
 void ensureFolders(FS &fs) {
-    if (!folderExists(fs, kRootDir)) createFolder(fs, kRootDir);
-    if (!folderExists(fs, kModelsDir)) createFolder(fs, kModelsDir);
+    // sd_functions.cpp's createFolder() is the interactive file-manager
+    // "New Folder" action - it always pops a keyboard prompt for a name and
+    // creates it *under* the given path. We want these two fixed paths to
+    // just silently exist, so call fs.mkdir() directly instead. Without an
+    // SD card (LittleFS fallback, where these folders don't already exist
+    // from a prior run) createFolder() here was popping the folder-name
+    // keyboard twice on every launch before ever reaching the start screen.
+    if (!folderExists(fs, kRootDir)) fs.mkdir(kRootDir);
+    if (!folderExists(fs, kModelsDir)) fs.mkdir(kModelsDir);
 }
 
 // Draws a message starting at the top of the content area, an optional
@@ -407,16 +428,18 @@ void renderSettingsRows(
     struct Row {
         const char *label;
         String value;
-    } rows[5] = {
+    } rows[7] = {
         {"Temperature", String(s.temperature, 1)},
         {"Top-p", String(s.topP, 2)},
         {"Rep. Penalty", String(s.repetitionPenalty, 2)},
         {"Max Tokens", String(s.maxTokens)},
         {"Seed", String(kSeedPresets[s.seedPresetIndex].label)},
+        {"Chat Template", s.chatTemplateEnabled ? "On >" : "Off >"},
+        {"Reset to Default", ">"},
     };
 
     tft.setTextSize(FP);
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 7; i++) {
         int rowY = startY + i * rowH;
         bool selected = (cursor == i);
         bool editingThis = (edit.editing && edit.editRow == i);
@@ -433,11 +456,172 @@ void renderSettingsRows(
     }
 }
 
+// Sub-menu opened from the "Chat Template" row: toggles the template on/off
+// and lets the user re-type the tags with the same keyboard() overlay used
+// for prompt entry. Mutates `s` in place - the parent settings screen owns
+// persisting it (via its own Save row / Esc-to-save), so nothing is written
+// to disk here.
+void showChatTemplateScreen(BruceLMSettings &s) {
+    constexpr int kNumRows = 3;
+    constexpr int kSaveRow = 3; // bottom action row, same spot/style as the parent screen's Save
+    constexpr int kNumItems = 4;
+    int cursor = 0;
+    ChatGeometry g = computeGeometry();
+    int rowH = g.lineH + 4;
+    int startY = g.outputTop;
+    bool redraw = true;
+
+    for (;;) {
+        if (redraw) {
+            drawMainBorderWithTitle("Chat Template");
+            struct Row {
+                const char *label;
+                String value;
+            } rows[kNumRows] = {
+                {"Enabled",  s.chatTemplateEnabled ? "On" : "Off"},
+                {"User tag", s.userTag                           },
+                {"Bot tag",  s.botTag                            },
+            };
+
+            tft.setTextSize(FP);
+            for (int i = 0; i < kNumRows; i++) {
+                int rowY = startY + i * rowH;
+                tft.fillRect(
+                    BORDER_PAD_X, rowY, tftWidth - 2 * BORDER_PAD_X, rowH, bruceConfig.bgColor
+                );
+                tft.setTextColor(cursor == i ? TFT_YELLOW : bruceConfig.priColor, bruceConfig.bgColor);
+                tft.setCursor(BORDER_PAD_X, rowY + 2);
+                tft.print(rows[i].label);
+
+                int labelW = (int)String(rows[i].label).length() + 1;
+                String valueText = truncateToWidth(rows[i].value, max(1, g.maxChars - labelW));
+                int vx = tftWidth - BORDER_PAD_X - (int)(valueText.length() * FP * LW);
+                tft.setCursor(vx, rowY + 2);
+                tft.print(valueText);
+            }
+
+            int saveY = startY + kSaveRow * rowH;
+            tft.fillRect(BORDER_PAD_X, saveY, tftWidth - 2 * BORDER_PAD_X, rowH, bruceConfig.bgColor);
+            tft.setTextColor(cursor == kSaveRow ? TFT_YELLOW : bruceConfig.priColor, bruceConfig.bgColor);
+            String saveLabel = "[ Save ]";
+            int sx = (tftWidth - (int)(saveLabel.length() * FP * LW)) / 2;
+            tft.setCursor(sx, saveY + 2);
+            tft.print(saveLabel);
+
+            tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+            String hint = "OK: edit  Esc: save+exit";
+            int hintTextY = g.footerY + (kFooterH - g.lineH) / 2;
+            tft.fillRect(0, hintTextY - 2, tftWidth, g.lineH + 4, bruceConfig.bgColor);
+            int hx = (tftWidth - (int)(hint.length() * FP * LW)) / 2;
+            if (hx < BORDER_PAD_X) hx = BORDER_PAD_X;
+            tft.setCursor(hx, hintTextY);
+            tft.print(hint);
+            redraw = false;
+        }
+
+        // Every field here mutates `s` immediately (no separate edit-mode
+        // buffer to revert) - Save and Esc are therefore equivalent, both
+        // just returning to the parent screen, which owns actually
+        // persisting `s` to disk. Kept as two controls anyway to match the
+        // parent settings screen's look and feel.
+        if (check(EscPress)) return;
+        if (check(SelPress)) {
+            if (cursor == kSaveRow) {
+                return;
+            } else if (cursor == 0) {
+                s.chatTemplateEnabled = !s.chatTemplateEnabled;
+            } else if (cursor == 1) {
+                String v = keyboard(s.userTag, 32, "User tag:");
+                if (v.length() > 0) s.userTag = v;
+            } else {
+                String v = keyboard(s.botTag, 32, "Bot tag:");
+                if (v.length() > 0) s.botTag = v;
+            }
+            redraw = true;
+        } else if (check(NextPress)) {
+            cursor = (cursor + 1) % kNumItems;
+            redraw = true;
+        } else if (check(PrevPress)) {
+            cursor = (cursor + kNumItems - 1) % kNumItems;
+            redraw = true;
+        }
+
+        delay(30);
+    }
+}
+
+// Sub-menu opened from the "Reset to Default" row: explains what's about to
+// happen, then a single centered "Confirm" action (same highlighted-row look
+// as showStartScreen's Start/Settings rows) rather than a bare Select/Esc
+// dialog, so it can't be triggered by one accidental button press. Returns
+// true if the user confirmed (config file deleted); the caller is
+// responsible for treating that as "abandon whatever was in progress".
+bool showResetToDefaultScreen(FS &fs) {
+    ChatGeometry g = computeGeometry();
+    String msg = "Reset all BruceLM settings to\n"
+                 "default values? This deletes\n"
+                 "the saved config file.\n"
+                 "\n"
+                 "Models on the SD card are not\n"
+                 "affected.";
+    std::vector<String> lines = wrapText(msg, g.maxChars);
+
+    int rowH = g.lineH + 6;
+    int afterTextY = g.outputTop + (int)lines.size() * g.lineH + 4;
+    int aboveFooterY = g.footerY - 4;
+    int confirmY = afterTextY + max(0, (aboveFooterY - afterTextY - rowH) / 2);
+
+    bool redraw = true;
+    for (;;) {
+        if (redraw) {
+            drawMainBorderWithTitle("Reset to Default");
+            tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+            int y = g.outputTop;
+            for (auto &line : lines) {
+                tft.setCursor(BORDER_PAD_X, y);
+                tft.print(line);
+                y += g.lineH;
+            }
+
+            tft.fillRect(BORDER_PAD_X, confirmY, tftWidth - 2 * BORDER_PAD_X, rowH, bruceConfig.bgColor);
+            tft.setTextColor(TFT_YELLOW, bruceConfig.bgColor);
+            String label = "> Confirm";
+            int lx = (tftWidth - (int)(label.length() * FP * LW)) / 2;
+            tft.setCursor(lx, confirmY + 2);
+            tft.print(label);
+
+            tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+            String hint = "OK: confirm  Esc: cancel";
+            int hintTextY = g.footerY + (kFooterH - g.lineH) / 2;
+            int hx = (tftWidth - (int)(hint.length() * FP * LW)) / 2;
+            if (hx < BORDER_PAD_X) hx = BORDER_PAD_X;
+            tft.setCursor(hx, hintTextY);
+            tft.print(hint);
+            redraw = false;
+        }
+
+        if (check(EscPress)) return false;
+        if (check(SelPress)) {
+            if (fs.exists(kConfigPath)) fs.remove(kConfigPath);
+            return true;
+        }
+        delay(30);
+    }
+}
+
 // ble_spam.cpp-style row editor: Next/Prev moves the cursor between rows,
 // Select enters/exits edit mode on the highlighted row, Next/Prev while
 // editing adjusts that row's value, Esc while editing reverts to the value
-// it had before editing started, Esc while browsing saves and exits.
-void showSettingsScreen(FS &fs) {
+// it had before editing started, Esc while browsing saves and exits. The
+// "Chat Template" and "Reset to Default" rows are the exceptions - Select on
+// either always opens its own sub-screen instead of inline-editing, since
+// neither is a single adjustable number.
+//
+// Returns true if the user reset to defaults (config file deleted) - the
+// caller should treat this as "abandon whatever was in progress and go back
+// to the top-level BruceLM menu" rather than resuming with the just-deleted
+// settings.
+bool showSettingsScreen(FS &fs) {
     BruceLMSettings s = loadSettings(fs);
     SettingsEditState edit;
     int cursor = 0;
@@ -448,8 +632,10 @@ void showSettingsScreen(FS &fs) {
     bool redraw = true;
     drawMainBorderWithTitle("BruceLM Settings");
 
-    constexpr int kSaveRow = 5;  // bottom action row, ble_spam "[ Start ]"-style
-    constexpr int kNumItems = 6; // 5 editable rows + save
+    constexpr int kChatTemplateRow = 5; // opens showChatTemplateScreen() on Select
+    constexpr int kResetRow = 6;        // opens showResetToDefaultScreen() on Select
+    constexpr int kSaveRow = 7;         // bottom action row, ble_spam "[ Start ]"-style
+    constexpr int kNumItems = 8;        // 7 rows + save
 
     for (;;) {
         if (redraw) {
@@ -489,14 +675,20 @@ void showSettingsScreen(FS &fs) {
                 redraw = true;
             } else {
                 saveSettings(fs, s);
-                return;
+                return false;
             }
         } else if (check(SelPress)) {
             if (edit.editing) {
                 edit.editing = false;
             } else if (cursor == kSaveRow) {
                 saveSettings(fs, s);
-                return;
+                return false;
+            } else if (cursor == kResetRow) {
+                if (showResetToDefaultScreen(fs)) return true;
+                drawMainBorderWithTitle("BruceLM Settings");
+            } else if (cursor == kChatTemplateRow) {
+                showChatTemplateScreen(s);
+                drawMainBorderWithTitle("BruceLM Settings");
             } else {
                 edit.editing = true;
                 edit.editRow = cursor;
@@ -636,7 +828,7 @@ void showLoadingScreen(const String &modelFileName, const String &tokenizerFileN
 // cancelled generation (Esc) partway through.
 bool runChatTurn(ChatSession &session, LLMEngine &engine, const String &userPrompt) {
     session.messages.push_back({true, "You: " + userPrompt});
-    session.messages.push_back({false, ""});
+    session.messages.push_back({false, "> "}); // "> " prefix, same style as the input bar preview
     session.inputBarPreview = userPrompt;
     session.followBottom = true;
     renderChat(session, /*force=*/true);
@@ -646,6 +838,9 @@ bool runChatTurn(ChatSession &session, LLMEngine &engine, const String &userProm
     params.topP = session.settings.topP;
     params.repetitionPenalty = session.settings.repetitionPenalty;
     params.seed = session.settings.seed();
+    params.chatTemplateEnabled = session.settings.chatTemplateEnabled;
+    params.userTag = session.settings.userTag;
+    params.botTag = session.settings.botTag;
 
     bool cancelled = false;
     engine.generate(userPrompt, session.settings.maxTokens, params, [&](const String &piece) -> bool {
@@ -671,13 +866,19 @@ bool runChatTurn(ChatSession &session, LLMEngine &engine, const String &userProm
     return !cancelled;
 }
 
-void chatLoop(LLMEngine &engine, FS &fs, const BruceLMSettings &settings) {
+// Exit: user backed out of the chat (Esc) - bruceLM_setup() should exit the
+// whole module. ResetToMenu: settings were reset to defaults from within the
+// chat - bruceLM_setup() should abandon this session and redisplay the
+// top-level start screen instead.
+enum class ChatLoopResult { Exit, ResetToMenu };
+
+ChatLoopResult chatLoop(LLMEngine &engine, FS &fs, const BruceLMSettings &settings) {
     ChatSession session;
     session.settings = settings;
     renderChat(session, /*force=*/true);
 
     for (;;) {
-        if (check(EscPress)) return;
+        if (check(EscPress)) return ChatLoopResult::Exit;
         if (check(SelPress)) {
             String prompt = keyboard("", 200, "Prompt:");
             String trimmed = prompt;
@@ -688,7 +889,7 @@ void chatLoop(LLMEngine &engine, FS &fs, const BruceLMSettings &settings) {
                 // chatting (Next/Prev already scroll, Select starts a prompt,
                 // Esc exits) - reusing the existing prompt entry as a command
                 // avoids adding a new input mapping.
-                showSettingsScreen(fs);
+                if (showSettingsScreen(fs)) return ChatLoopResult::ResetToMenu;
                 session.settings = loadSettings(fs);
                 renderChat(session, /*force=*/true);
             } else if (prompt.length() > 0) {
@@ -742,73 +943,78 @@ void bruceLM_setup() {
         StartAction action = showStartScreen();
         if (action == StartAction::Exit) return;
         if (action == StartAction::Settings) {
+            // Return value (reset-to-default) is irrelevant here - we're
+            // already about to redisplay the start screen either way.
             showSettingsScreen(*fs);
             continue;
         }
-        break; // StartAction::Start
-    }
+        // action == StartAction::Start
 
-    BruceLMSettings settings = loadSettings(*fs);
+        BruceLMSettings settings = loadSettings(*fs);
 
-    if (!showConfirm(
-            "Select a model checkpoint file.\n"
-            "\n"
-            "(e.g. \"stories260K.bin\")",
-            "OK: continue   Esc: cancel",
-            "Press OK to open the file picker"
-        ))
-        return;
-    String checkpointPath = loopSD(*fs, true, "bin", kModelsDir);
-    if (checkpointPath.length() == 0) return; // user backed out of the picker
-
-    if (!showConfirm(
-            "Select the tokenizer file that\n"
-            "matches your model.\n"
-            "\n"
-            "(e.g. \"tok512.bin\")",
-            "OK: continue   Esc: cancel",
-            "Press OK to open the file picker"
-        ))
-        return;
-    String tokenizerPath = loopSD(*fs, true, "bin", kModelsDir);
-    if (tokenizerPath.length() == 0) return; // user backed out of the picker
-
-    String modelFileName = checkpointPath.substring(checkpointPath.lastIndexOf('/') + 1);
-    String tokenizerFileName = tokenizerPath.substring(tokenizerPath.lastIndexOf('/') + 1);
-    showLoadingScreen(modelFileName, tokenizerFileName);
-
-    LLMEngine engine;
-    LLMLoadError err = engine.load(*fs, checkpointPath, tokenizerPath);
-
-    if (err == LLMLoadError::IncompatibleGroupSize || err == LLMLoadError::ConfigTooLarge)
-        err = confirmRiskyLoad(
-            *fs, checkpointPath, tokenizerPath, engine, err, modelFileName, tokenizerFileName
-        );
-
-    switch (err) {
-        case LLMLoadError::None: break;
-        case LLMLoadError::CheckpointNotFound:
-        case LLMLoadError::TokenizerNotFound:
-            showMessageAndWait("Model or tokenizer file went missing.");
+        if (!showConfirm(
+                "Select a model checkpoint file.\n"
+                "\n"
+                "(e.g. \"stories260K.bin\")",
+                "OK: continue   Esc: cancel",
+                "Press OK to open the file picker"
+            ))
             return;
-        case LLMLoadError::BadMagicOrVersion:
-            showMessageAndWait(
-                "Unrecognized checkpoint format.\n"
-                "Expected a llama2.c export.py v1/v2\n"
-                "file, or the original header-less\n"
-                "format karpathy/tinyllamas ships."
+        String checkpointPath = loopSD(*fs, true, "bin", kModelsDir);
+        if (checkpointPath.length() == 0) return; // user backed out of the picker
+
+        if (!showConfirm(
+                "Select the tokenizer file that\n"
+                "matches your model.\n"
+                "\n"
+                "(e.g. \"tok512.bin\")",
+                "OK: continue   Esc: cancel",
+                "Press OK to open the file picker"
+            ))
+            return;
+        String tokenizerPath = loopSD(*fs, true, "bin", kModelsDir);
+        if (tokenizerPath.length() == 0) return; // user backed out of the picker
+
+        String modelFileName = checkpointPath.substring(checkpointPath.lastIndexOf('/') + 1);
+        String tokenizerFileName = tokenizerPath.substring(tokenizerPath.lastIndexOf('/') + 1);
+        showLoadingScreen(modelFileName, tokenizerFileName);
+
+        LLMEngine engine;
+        LLMLoadError err = engine.load(*fs, checkpointPath, tokenizerPath);
+
+        if (err == LLMLoadError::IncompatibleGroupSize || err == LLMLoadError::ConfigTooLarge)
+            err = confirmRiskyLoad(
+                *fs, checkpointPath, tokenizerPath, engine, err, modelFileName, tokenizerFileName
             );
-            return;
-        case LLMLoadError::ConfigTooLarge:
-            showMessageAndWait("Could not load: model too large for available memory.");
-            return;
-        case LLMLoadError::OutOfMemory:
-            showMessageAndWait("Out of memory while allocating model buffers.");
-            return;
-        case LLMLoadError::IncompatibleGroupSize:
-            showMessageAndWait("Could not load: incompatible quantized model.");
-            return;
-    }
 
-    chatLoop(engine, *fs, settings);
+        switch (err) {
+            case LLMLoadError::None: break;
+            case LLMLoadError::CheckpointNotFound:
+            case LLMLoadError::TokenizerNotFound:
+                showMessageAndWait("Model or tokenizer file went missing.");
+                return;
+            case LLMLoadError::BadMagicOrVersion:
+                showMessageAndWait(
+                    "Unrecognized checkpoint format.\n"
+                    "Expected a llama2.c export.py v1/v2\n"
+                    "file, or the original header-less\n"
+                    "format karpathy/tinyllamas ships."
+                );
+                return;
+            case LLMLoadError::ConfigTooLarge:
+                showMessageAndWait("Could not load: model too large for available memory.");
+                return;
+            case LLMLoadError::OutOfMemory:
+                showMessageAndWait("Out of memory while allocating model buffers.");
+                return;
+            case LLMLoadError::IncompatibleGroupSize:
+                showMessageAndWait("Could not load: incompatible quantized model.");
+                return;
+        }
+
+        // ResetToMenu (settings reset to default from within the chat)
+        // loops back to the top-level start screen instead of exiting.
+        if (chatLoop(engine, *fs, settings) == ChatLoopResult::ResetToMenu) continue;
+        return;
+    }
 }

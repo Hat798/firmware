@@ -561,13 +561,19 @@ void LLMEngine::generate(
     int kvMul = heads / kvHeads;
     int gs = m->groupSize;
 
+    // Chat-finetuned checkpoints expect the exact "<user>: ...\n<bot>: ..."
+    // shape they were trained on; wrap the raw prompt in it here rather than
+    // pushing that formatting onto every caller.
+    String effectivePrompt =
+        params.chatTemplateEnabled ? (params.userTag + prompt + "\n" + params.botTag) : prompt;
+
     // Matches run.c's encode(): BOS token (id 1) first, then sentencepiece's
     // "dummy prefix" space token, then the actual encoded text. Skipping
     // these (as an earlier version of this engine did) feeds the model a
     // prompt shaped differently from anything it saw in training.
-    int *bodyIds = (int *)alloca(sizeof(int) * (prompt.length() + 1));
+    int *bodyIds = (int *)alloca(sizeof(int) * (effectivePrompt.length() + 1));
     int nBody = 0;
-    encodeBpeGreedy(prompt, m->vocab.get(), m->vocabSize, bodyIds, nBody);
+    encodeBpeGreedy(effectivePrompt, m->vocab.get(), m->vocabSize, bodyIds, nBody);
 
     int spaceId = 0;
     for (int v = 0; v < m->vocabSize; v++) {
@@ -580,11 +586,15 @@ void LLMEngine::generate(
     int *promptIds = (int *)alloca(sizeof(int) * (nBody + 2));
     int nPrompt = 0;
     promptIds[nPrompt++] = 1; // BOS
-    if (prompt.length() > 0) promptIds[nPrompt++] = spaceId;
+    if (effectivePrompt.length() > 0) promptIds[nPrompt++] = spaceId;
     for (int i = 0; i < nBody; i++) promptIds[nPrompt++] = bodyIds[i];
 
     int steps = maxTokens < seqLen ? maxTokens : seqLen;
     int token = promptIds[0];
+    // Rolling tail of recently-emitted text, only used when chatTemplateEnabled
+    // - lets us notice the model re-emitting userTag (drifting into a fake new
+    // turn) and stop right there instead of streaming it to the UI.
+    String tailBuffer;
 
     for (int pos = 0; pos < steps; pos++) {
         // --- forward pass for `token` at position `pos` ---
@@ -683,12 +693,31 @@ void LLMEngine::generate(
 
         if (pos >= nPrompt - 1) {
             String piece = decodePiece(m->vocab[token]);
+            if (params.chatTemplateEnabled && params.userTag.length() > 0) {
+                String combined = tailBuffer + piece;
+                int tagPos = combined.indexOf(params.userTag);
+                if (tagPos != -1) {
+                    // The model started echoing userTag - it's hallucinating a
+                    // new turn. Emit only what came before the tag, then stop.
+                    int emitLen = tagPos - (int)tailBuffer.length();
+                    if (emitLen > 0) onToken(piece.substring(0, emitLen));
+                    return;
+                }
+                tailBuffer = combined;
+                int maxKeep = (int)params.userTag.length() * 2 + 8;
+                if ((int)tailBuffer.length() > maxKeep)
+                    tailBuffer = tailBuffer.substring(tailBuffer.length() - maxKeep);
+            }
             if (!onToken(piece)) return; // cancelled
         }
         // EOS (id 2, by llama2.c/sentencepiece convention) marks a natural
         // end of generation - stop instead of rambling on past it. Only
         // meaningful once we're actually generating, not echoing the prompt.
         if (pos >= nPrompt - 1 && nextToken == 2) return;
+        // BOS (id 1) delimits sequences, matching run.c's generate() loop - a model that
+        // starts predicting a fresh BOS mid-generation is drifting into a new/unrelated
+        // sequence, so stop here too rather than rambling into a hallucinated new turn.
+        if (pos >= nPrompt - 1 && nextToken == 1) return;
         history.push_back(token);
         if (history.size() > 64) history.erase(history.begin());
         token = nextToken;

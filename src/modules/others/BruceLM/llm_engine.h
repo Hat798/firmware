@@ -56,6 +56,17 @@ struct GenerationParams {
     float repetitionPenalty = 1.0f; // 1.0 = disabled, >1.0 discourages repeating recent tokens
     uint32_t seed = 0;              // 0 = reseed from hardware RNG each call (non-reproducible);
                                      // nonzero = deterministic output for the same prompt
+
+    // Chat-finetuned checkpoints (unlike plain story models) are trained on
+    // "<user>: ...\n<bot>: ..." pairs - fed raw text with no cue for whose
+    // turn it is, they'll hallucinate a whole fake exchange (including their
+    // own userTag) before ever answering. When enabled, the prompt is
+    // wrapped as userTag + prompt + "\n" + botTag before encoding, and
+    // generation stops the moment userTag reappears in the output (the model
+    // drifting into a new fake turn) instead of rambling past it.
+    bool chatTemplateEnabled = false;
+    String userTag = "<user>: ";
+    String botTag = "<bot>: ";
 };
 
 class LLMEngine {
