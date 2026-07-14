@@ -66,7 +66,7 @@ struct GenerationParams {
     // drifting into a new fake turn) instead of rambling past it.
     bool chatTemplateEnabled = true;
     String userTag = "<user>: ";
-    String botTag = "<bot>: ";
+    String botTag = "<bot>:";
 };
 
 class LLMEngine {

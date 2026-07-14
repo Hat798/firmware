@@ -96,7 +96,7 @@ struct BruceLMSettings {
     int seedPresetIndex = kDefaultSeedPresetIndex;
     bool chatTemplateEnabled = true;
     String userTag = "<user>: ";
-    String botTag = "<bot>: ";
+    String botTag = "<bot>:";
 
     uint32_t seed() const { return kSeedPresets[seedPresetIndex].value; }
 };
