@@ -21,6 +21,7 @@
 #include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <vector>
@@ -40,6 +41,22 @@ struct QuantizedTensor {
     int8_t *q = nullptr; // quantized values
     float *s = nullptr;  // per-group scales
 };
+
+// Vocab entries sorted by string, for run.c-style binary-search token lookup
+// during BPE encoding (str_lookup()/sorted_vocab in run.c's encode()).
+struct TokenIndex {
+    const char *str;
+    int id;
+};
+
+int strLookup(const char *str, const std::vector<TokenIndex> &sorted) {
+    auto it = std::lower_bound(
+        sorted.begin(), sorted.end(), str,
+        [](const TokenIndex &a, const char *s) { return strcmp(a.str, s) < 0; }
+    );
+    if (it != sorted.end() && strcmp(it->str, str) == 0) return it->id;
+    return -1;
+}
 
 float *readF32Vec(File &f, size_t n) {
     float *buf = (float *)psram_alloc(n * sizeof(float));
@@ -167,6 +184,7 @@ struct LLMEngine::Impl {
     std::unique_ptr<char *[]> vocab;
     std::unique_ptr<float[]> vocabScores;
     int vocabSize = 0;
+    std::vector<TokenIndex> sortedVocab; // built once after vocab loads, for BPE merge lookups
 
     ~Impl() { freeAll(); }
 
@@ -401,6 +419,12 @@ LLMLoadError LLMEngine::load(
     }
     tf.close();
 
+    impl->sortedVocab.resize(vocab);
+    for (int i = 0; i < vocab; i++) impl->sortedVocab[i] = {impl->vocab[i], i};
+    std::sort(impl->sortedVocab.begin(), impl->sortedVocab.end(), [](const TokenIndex &a, const TokenIndex &b) {
+        return strcmp(a.str, b.str) < 0;
+    });
+
     // run-state buffers (small, fp32, PSRAM)
     impl->x = (float *)psram_alloc(dim * sizeof(float));
     impl->xb = (float *)psram_alloc(dim * sizeof(float));
@@ -519,30 +543,71 @@ String decodePiece(const char *piece) {
     return String(piece);
 }
 
-String encodeBpeGreedy(const String &text, char **vocab, int vocabSize, int *outIds, int &outCount) {
-    // Minimal byte-level fallback tokenizer: match the longest vocab entry at
-    // each position, else emit the raw byte token if present in vocab.
+// Faithful port of run.c's encode(): seed one token per UTF-8 codepoint
+// (falling back to individual bytes, offset +3 for the <unk>/<s>/</s>
+// slots, when a codepoint has no standalone vocab entry) - prefixed with BOS
+// and a "dummy prefix" space token, same as run.c - then repeatedly merge
+// whichever adjacent pair scores highest in vocab_scores until no merge is
+// left. Critically, BOS and the dummy prefix must be seeded *before* the
+// merge loop runs (as run.c does) so they can themselves take part in a
+// merge, e.g. the dummy-prefix space merging with a leading "<" into one
+// token - appending them afterwards, outside the merge loop, silently
+// produces a different, longer token sequence than run.c for the same text.
+// This is the actual BPE algorithm the tokenizer/model were trained with -
+// a naive longest-match-at-each-position tokenizer (what an earlier version
+// of this function did) produces a different token sequence for the same
+// text, which is out-of-distribution for the model and comes out as
+// unrelated, garbled output even though the weights and prompt text are
+// both correct.
+void encodeBpe(
+    const String &text, char **vocab, const float *vocabScores, const std::vector<TokenIndex> &sortedVocab,
+    int *outIds, int &outCount
+) {
     outCount = 0;
-    size_t i = 0;
-    while (i < (size_t)text.length()) {
-        int bestId = -1, bestLen = 0;
-        for (int v = 0; v < vocabSize; v++) {
-            size_t l = strlen(vocab[v]);
-            if (l > 0 && l <= text.length() - i && text.substring(i, i + l) == vocab[v]) {
-                if ((int)l > bestLen) {
-                    bestLen = l;
-                    bestId = v;
-                }
+    outIds[outCount++] = 1; // BOS
+    if (text.length() == 0) return;
+    outIds[outCount++] = strLookup(" ", sortedVocab); // dummy prefix
+
+    char strBuffer[5]; // up to 4 UTF-8 bytes + null terminator
+    size_t strLen = 0;
+    const char *text_c = text.c_str();
+
+    for (const char *c = text_c; *c != '\0'; c++) {
+        // 0x80 continuation bytes start a fresh codepoint's byte run when
+        // absent - see run.c's encode() for the same bit-trick explanation.
+        if ((*c & 0xC0) != 0x80) strLen = 0;
+        strBuffer[strLen++] = *c;
+        strBuffer[strLen] = '\0';
+
+        if ((unsigned char)(*(c + 1)) != 0 && (*(c + 1) & 0xC0) == 0x80 && strLen < 4) continue;
+
+        int id = strLookup(strBuffer, sortedVocab);
+        if (id != -1) {
+            outIds[outCount++] = id;
+        } else {
+            for (size_t i = 0; i < strLen; i++) outIds[outCount++] = (unsigned char)strBuffer[i] + 3;
+        }
+        strLen = 0;
+    }
+
+    char mergeBuf[256];
+    for (;;) {
+        float bestScore = -1e10f;
+        int bestId = -1, bestIdx = -1;
+        for (int i = 0; i < outCount - 1; i++) {
+            snprintf(mergeBuf, sizeof(mergeBuf), "%s%s", vocab[outIds[i]], vocab[outIds[i + 1]]);
+            int id = strLookup(mergeBuf, sortedVocab);
+            if (id != -1 && vocabScores[id] > bestScore) {
+                bestScore = vocabScores[id];
+                bestId = id;
+                bestIdx = i;
             }
         }
-        if (bestId < 0) {
-            bestLen = 1;
-            bestId = 0; // unknown -> id 0 by convention
-        }
-        outIds[outCount++] = bestId;
-        i += bestLen;
+        if (bestIdx == -1) break;
+        outIds[bestIdx] = bestId;
+        for (int i = bestIdx + 1; i < outCount - 1; i++) outIds[i] = outIds[i + 1];
+        outCount--;
     }
-    return "";
 }
 } // namespace
 
@@ -567,27 +632,12 @@ void LLMEngine::generate(
     String effectivePrompt =
         params.chatTemplateEnabled ? (params.userTag + prompt + "\n" + params.botTag) : prompt;
 
-    // Matches run.c's encode(): BOS token (id 1) first, then sentencepiece's
-    // "dummy prefix" space token, then the actual encoded text. Skipping
-    // these (as an earlier version of this engine did) feeds the model a
-    // prompt shaped differently from anything it saw in training.
-    int *bodyIds = (int *)alloca(sizeof(int) * (effectivePrompt.length() + 1));
-    int nBody = 0;
-    encodeBpeGreedy(effectivePrompt, m->vocab.get(), m->vocabSize, bodyIds, nBody);
-
-    int spaceId = 0;
-    for (int v = 0; v < m->vocabSize; v++) {
-        if (strcmp(m->vocab[v], " ") == 0) {
-            spaceId = v;
-            break;
-        }
-    }
-
-    int *promptIds = (int *)alloca(sizeof(int) * (nBody + 2));
+    // encodeBpe() seeds BOS + the dummy-prefix space token itself, ahead of
+    // the merge loop, so they can take part in merges exactly like run.c's
+    // encode() does.
+    int *promptIds = (int *)alloca(sizeof(int) * (effectivePrompt.length() + 2));
     int nPrompt = 0;
-    promptIds[nPrompt++] = 1; // BOS
-    if (effectivePrompt.length() > 0) promptIds[nPrompt++] = spaceId;
-    for (int i = 0; i < nBody; i++) promptIds[nPrompt++] = bodyIds[i];
+    encodeBpe(effectivePrompt, m->vocab.get(), m->vocabScores.get(), m->sortedVocab, promptIds, nPrompt);
 
     int steps = maxTokens < seqLen ? maxTokens : seqLen;
     int token = promptIds[0];
@@ -691,7 +741,18 @@ void LLMEngine::generate(
             nextToken = sampleToken(m->logits, vocab, params.temperature, params.topP, rngState);
         }
 
-        if (pos >= nPrompt - 1) {
+        // run.c's generate() loop prints decode(token, next) every iteration
+        // - i.e. it always prints the *next* token's text, not the current
+        // one - so its prompt-echo naturally ends and real generation begins
+        // the moment `next` stops being forced from the prompt (pos >=
+        // nPrompt - 1). We print `token` (already-advanced from the previous
+        // iteration) instead of `next`, which is the same stream one loop
+        // tick later - so our matching cutover is pos >= nPrompt, not
+        // nPrompt - 1. Gating on nPrompt - 1 here would print `token` while
+        // it's still the final prompt token itself (e.g. the last subword of
+        // the user's own prompt text), leaking one leftover fragment of the
+        // prompt onto the front of the displayed reply.
+        if (pos >= nPrompt) {
             String piece = decodePiece(m->vocab[token]);
             if (params.chatTemplateEnabled && params.userTag.length() > 0) {
                 String combined = tailBuffer + piece;
