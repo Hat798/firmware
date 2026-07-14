@@ -64,7 +64,7 @@ struct GenerationParams {
     // wrapped as userTag + prompt + "\n" + botTag before encoding, and
     // generation stops the moment userTag reappears in the output (the model
     // drifting into a new fake turn) instead of rambling past it.
-    bool chatTemplateEnabled = false;
+    bool chatTemplateEnabled = true;
     String userTag = "<user>: ";
     String botTag = "<bot>: ";
 };

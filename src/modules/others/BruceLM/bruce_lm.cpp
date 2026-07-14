@@ -85,15 +85,16 @@ constexpr int kDefaultSeedPresetIndex = kNumSeedPresets - 1; // "Random"
 // Wraps prompts as `userTag + prompt + "\n" + botTag` before encoding, so a
 // chat-finetuned model (trained on that exact "<user>: ...\n<bot>: ..." pair
 // format) is cued to answer immediately instead of hallucinating a whole
-// fake turn. Off by default since plain story models (e.g. stories260K.bin)
-// were never trained on any such template and expect raw text.
+// fake turn. On by default to match Chat1M.bin, the default recommended
+// model - plain story models (e.g. stories260K.bin) were never trained on
+// any such template and expect raw text, so turn this off for those.
 struct BruceLMSettings {
     float temperature = 0.8f;
     float topP = 0.9f;
     float repetitionPenalty = 1.0f;
     int maxTokens = 256;
     int seedPresetIndex = kDefaultSeedPresetIndex;
-    bool chatTemplateEnabled = false;
+    bool chatTemplateEnabled = true;
     String userTag = "<user>: ";
     String botTag = "<bot>: ";
 
@@ -435,7 +436,7 @@ void renderSettingsRows(
         {"Max Tokens", String(s.maxTokens)},
         {"Seed", String(kSeedPresets[s.seedPresetIndex].label)},
         {"Chat Template", s.chatTemplateEnabled ? "On >" : "Off >"},
-        {"Reset to Default", ">"},
+        {"Reset to Default", "Reset >"},
     };
 
     tft.setTextSize(FP);
@@ -725,64 +726,50 @@ bool showSettingsScreen(FS &fs) {
     }
 }
 
-enum class StartAction { Start, Settings, Exit };
+enum class StartAction { Start, HowToRun, Settings, Exit };
 
-// First screen: short concrete instructions above two selectable action
-// rows ("Start" / "Settings"), same cursor+Next/Prev+Select style as the
-// settings screen above, with the button hints pinned to the bottom.
+// First screen: a one-line pitch above three selectable action rows
+// ("Start" / "How to Run" / "Settings"), same cursor+Next/Prev+Select style
+// as the settings screen above, with the button hints pinned to the bottom.
 StartAction showStartScreen() {
     int cursor = 0;
-    const char *labels[2] = {"Start", "Settings"};
+    const char *labels[3] = {"Start", "How to Run", "Settings"};
+    constexpr int kNumRows = 3;
     ChatGeometry g = computeGeometry();
-    // Built as explicit (text, indented) rows rather than a single wrapped
-    // string - wrapLine() treats runs of leading spaces as word breaks and
-    // silently eats them, so indentation can't survive a plain "\n"-joined
-    // string round-tripped through wrapText().
-    struct InstructionRow {
-        String text;
-        bool indented;
-    };
-    std::vector<InstructionRow> instructionLines = {
-        {"1. Download a model and tokenizer file.",     false},
-        {"E.g: stories260K.bin and tok512.bin from:",   true },
-        {"https://tinyurl.com/Stories260K",             true },
-        {"2. Copy both files to SD card: BruceLM/models", false},
-    };
-    int indentPx = FP * LW * 3;
+    std::vector<String> pitchLines = wrapText("Run small LLMs locally on your Bruce device!", g.maxChars);
 
     int rowH = g.lineH + 6;
-    // Centered in the gap between the end of the instructions text and the
-    // footer hint row, rather than right under the text - clamped so it can
-    // never creep up into the text if the instructions are ever lengthened.
-    int afterTextY = g.outputTop + (int)instructionLines.size() * g.lineH + 4;
+    // A fixed-size gap under the header for the pitch text, so the button
+    // block's position doesn't shift around based on how long the pitch is.
+    int headerGap = g.lineH * 3;
+    int afterTextY = g.outputTop + headerGap;
     int aboveFooterY = g.footerY - 4;
-    int rowsBlockH = rowH * 2;
+    int rowsBlockH = rowH * kNumRows;
     // Biased toward the footer (rather than dead-centered in the gap) so the
     // buttons sit a bit further down the screen.
     int gapSpace = max(0, aboveFooterY - afterTextY - rowsBlockH);
-    int row1Y = afterTextY + (gapSpace * 2) / 3;
-    int row2Y = row1Y + rowH;
+    int firstRowY = afterTextY + (gapSpace * 2) / 3;
+    // Pitch text biased toward the bottom of its header gap (rather than
+    // dead-centered) so it sits a bit further down, closer to the Start button.
+    int pitchBlockH = (int)pitchLines.size() * g.lineH;
+    int pitchY = g.outputTop + max(0, ((headerGap - pitchBlockH) * 2) / 3);
 
     bool redraw = true;
     for (;;) {
         if (redraw) {
             drawMainBorderWithTitle("BruceLM");
-            int y = g.outputTop;
-            for (auto &row : instructionLines) {
-                // Dim the URL line to secColor, the same tone used for AI
-                // reply text, so it reads as secondary to the numbered steps.
-                bool isUrlLine = row.text.indexOf("tinyurl.com") >= 0;
-                tft.setTextColor(
-                    isUrlLine ? bruceConfig.secColor : bruceConfig.priColor, bruceConfig.bgColor
-                );
-                tft.setCursor(BORDER_PAD_X + (row.indented ? indentPx : 0), y);
-                tft.print(row.text);
+            tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+            int y = pitchY;
+            for (auto &line : pitchLines) {
+                int lx = (tftWidth - (int)(line.length() * FP * LW)) / 2;
+                if (lx < BORDER_PAD_X) lx = BORDER_PAD_X;
+                tft.setCursor(lx, y);
+                tft.print(line);
                 y += g.lineH;
             }
-            tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
 
-            for (int i = 0; i < 2; i++) {
-                int rowY = (i == 0) ? row1Y : row2Y;
+            for (int i = 0; i < kNumRows; i++) {
+                int rowY = firstRowY + i * rowH;
                 tft.fillRect(BORDER_PAD_X, rowY, tftWidth - 2 * BORDER_PAD_X, rowH, bruceConfig.bgColor);
                 tft.setTextColor(cursor == i ? TFT_YELLOW : bruceConfig.priColor, bruceConfig.bgColor);
                 String label = String("> ") + labels[i];
@@ -802,10 +789,141 @@ StartAction showStartScreen() {
         }
 
         if (check(EscPress)) return StartAction::Exit;
-        if (check(SelPress)) return cursor == 0 ? StartAction::Start : StartAction::Settings;
-        if (check(NextPress) || check(PrevPress)) {
-            cursor = 1 - cursor;
+        if (check(SelPress)) {
+            if (cursor == 0) return StartAction::Start;
+            if (cursor == 1) return StartAction::HowToRun;
+            return StartAction::Settings;
+        }
+        if (check(NextPress)) {
+            cursor = (cursor + 1) % kNumRows;
             redraw = true;
+        } else if (check(PrevPress)) {
+            cursor = (cursor + kNumRows - 1) % kNumRows;
+            redraw = true;
+        }
+        delay(30);
+    }
+}
+
+// Opened from the "How to Run" row: where to get models and where to put
+// them, ending in a single centered "Okay" action (same look as
+// showResetToDefaultScreen's "Confirm") that just returns to the caller,
+// which redisplays the start screen. The "Okay" row is pinned just above the
+// footer hint regardless of content length (sized to just fit its own text,
+// not a full row like the settings list), and the text above it scrolls with
+// the encoder (same NextPress/PrevPress convention as the chat view) - on
+// smaller screens the full text otherwise overflows past the border and
+// overlaps the fixed-position button/hint row. When there's more content
+// than fits, the last visible line is deliberately clipped to half height
+// (rather than simply omitted) as a visual cue that there's more below.
+void showHowToRunScreen() {
+    ChatGeometry g = computeGeometry();
+    // Built as explicit (text, indented, dimmed) rows rather than a single
+    // wrapped string - wrapLine() treats runs of leading spaces as word
+    // breaks and silently eats them, so indentation can't survive a plain
+    // "\n"-joined string round-tripped through wrapText().
+    struct InfoRow {
+        String text;
+        bool indented;
+        bool dimmed;
+    };
+    std::vector<InfoRow> lines = {
+        {"1. Download zipped model and",                    false, false},
+        {"tokenizer files from:",                           true,  false},
+        {"https://archive.org/details/BruceLM",             true,  true },
+        {"2. Unzip both files to SD card",                  false, false},
+        {"BruceLM/models/:",                                true,  false},
+        {"models/Chat1M/chat1M.bin",                        true,  true },
+        {"models/Chat1M/tok512.bin",                        true,  true },
+        {"models/Stories260K/stories260K.bin",              true,  true },
+        {"models/Stories260K/tok512.bin",                   true,  true },
+        {"3. Turn off chat templates",                       false, false},
+        {"for stories260K",                                  true,  false},
+        {"4. You can create your own models",               false, false},
+        {"using llama2.c by Karpathy",                      true,  false},
+    };
+    int indentPx = FP * LW * 3;
+    int lineH = g.lineH;
+
+    int okayRowH = lineH + 4; // just tall enough for the label, not a full list row
+    int okayY = g.footerY - 4 - okayRowH; // pinned above the footer, independent of content length
+
+    // Reserve one row at the top for the scroll-direction indicators, kept
+    // out of the text flow itself.
+    int textTop = g.outputTop;
+    int contentBottom = okayY - 4;
+    // Always leave room for a half-height clipped line at the bottom, so a
+    // full line's worth of space isn't silently reserved-but-unused when
+    // there's nothing left to scroll to.
+    int visibleFullLines = max(1, (contentBottom - textTop - lineH / 2) / lineH);
+    int scrollOffset = 0;
+    int maxScroll = max(0, (int)lines.size() - visibleFullLines);
+
+    bool redraw = true;
+    for (;;) {
+        if (redraw) {
+            drawMainBorderWithTitle("How to Run");
+
+            int y = textTop;
+            int i = 0;
+            for (; i < visibleFullLines; i++) {
+                int idx = scrollOffset + i;
+                if (idx >= (int)lines.size()) break;
+                InfoRow &row = lines[idx];
+                tft.setTextColor(
+                    row.dimmed ? bruceConfig.secColor : bruceConfig.priColor, bruceConfig.bgColor
+                );
+                tft.setCursor(BORDER_PAD_X + (row.indented ? indentPx : 0), y);
+                tft.print(row.text);
+                y += lineH;
+            }
+            // One more line, then mask its bottom half back out with the
+            // background color - Bruce's tft wrapper doesn't expose
+            // TFT_eSPI's setViewport/clipping, so "print then paint over"
+            // is the only way to fake a half-height clip here. Visual cue
+            // that there's more content below to scroll to.
+            int cutIdx = scrollOffset + i;
+            if (cutIdx < (int)lines.size()) {
+                InfoRow &row = lines[cutIdx];
+                tft.setTextColor(
+                    row.dimmed ? bruceConfig.secColor : bruceConfig.priColor, bruceConfig.bgColor
+                );
+                tft.setCursor(BORDER_PAD_X + (row.indented ? indentPx : 0), y);
+                tft.print(row.text);
+                tft.fillRect(
+                    BORDER_PAD_X, y + lineH / 2, tftWidth - 2 * BORDER_PAD_X, lineH - lineH / 2,
+                    bruceConfig.bgColor
+                );
+            }
+
+            tft.fillRect(BORDER_PAD_X, okayY, tftWidth - 2 * BORDER_PAD_X, okayRowH, bruceConfig.bgColor);
+            tft.setTextColor(TFT_YELLOW, bruceConfig.bgColor);
+            String label = "> Okay";
+            int lx = (tftWidth - (int)(label.length() * FP * LW)) / 2;
+            tft.setCursor(lx, okayY + 2);
+            tft.print(label);
+
+            tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+            String hint = "OK: back to menu  Esc: back";
+            int hintTextY = g.footerY + (kFooterH - lineH) / 2;
+            int hx = (tftWidth - (int)(hint.length() * FP * LW)) / 2;
+            if (hx < BORDER_PAD_X) hx = BORDER_PAD_X;
+            tft.setCursor(hx, hintTextY);
+            tft.print(hint);
+            redraw = false;
+        }
+
+        if (check(EscPress) || check(SelPress)) return;
+        if (check(NextPress)) {
+            if (scrollOffset < maxScroll) {
+                scrollOffset++;
+                redraw = true;
+            }
+        } else if (check(PrevPress)) {
+            if (scrollOffset > 0) {
+                scrollOffset--;
+                redraw = true;
+            }
         }
         delay(30);
     }
@@ -942,6 +1060,10 @@ void bruceLM_setup() {
     for (;;) {
         StartAction action = showStartScreen();
         if (action == StartAction::Exit) return;
+        if (action == StartAction::HowToRun) {
+            showHowToRunScreen();
+            continue;
+        }
         if (action == StartAction::Settings) {
             // Return value (reset-to-default) is irrelevant here - we're
             // already about to redisplay the start screen either way.
@@ -955,7 +1077,7 @@ void bruceLM_setup() {
         if (!showConfirm(
                 "Select a model checkpoint file.\n"
                 "\n"
-                "(e.g. \"stories260K.bin\")",
+                "(e.g. \"chat1M.bin\")",
                 "OK: continue   Esc: cancel",
                 "Press OK to open the file picker"
             ))
