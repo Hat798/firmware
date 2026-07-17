@@ -64,13 +64,27 @@ float *readF32Vec(File &f, size_t n) {
     return buf;
 }
 
-bool readQuantized(File &f, QuantizedTensor &t, size_t n, int groupSize) {
-    t.q = (int8_t *)psram_alloc(n);
-    size_t nGroups = n / groupSize;
-    t.s = (float *)psram_alloc(nGroups * sizeof(float));
+// Reads `units` back-to-back quantized sub-tensors of `sizePerUnit` elements
+// each (e.g. one per transformer layer), matching the on-disk layout written
+// by export.py's version2_export and read by upstream runq.c's
+// init_quantized_tensors(): every unit's int8 values are immediately
+// followed by that same unit's fp32 scale factors, unit by unit -
+// [q_0][s_0][q_1][s_1]...[q_{units-1}][s_{units-1}] - NOT one contiguous
+// block of all units' q values followed by one block of all their s values.
+// The in-memory result is still a single contiguous QuantizedTensor (q and s
+// each span all units), so layerView()/dequantize()/matmulQ() are unchanged;
+// only the read order from disk differs, to line up with the real format.
+bool readQuantized(File &f, QuantizedTensor &t, size_t sizePerUnit, int units, int groupSize) {
+    size_t groupsPerUnit = sizePerUnit / groupSize;
+    size_t totalSize = sizePerUnit * (size_t)units;
+    size_t totalGroups = groupsPerUnit * (size_t)units;
+    t.q = (int8_t *)psram_alloc(totalSize);
+    t.s = (float *)psram_alloc(totalGroups * sizeof(float));
     if (!t.q || !t.s) return false;
-    f.read((uint8_t *)t.q, n);
-    f.read((uint8_t *)t.s, nGroups * sizeof(float));
+    for (int i = 0; i < units; i++) {
+        f.read((uint8_t *)(t.q + (size_t)i * sizePerUnit), sizePerUnit);
+        f.read((uint8_t *)(t.s + (size_t)i * groupsPerUnit), groupsPerUnit * sizeof(float));
+    }
     return true;
 }
 
@@ -383,15 +397,15 @@ LLMLoadError LLMEngine::load(
         impl->rmsFfnW = readF32Vec(cf, (size_t)layers * dim);
         impl->rmsFinalW = readF32Vec(cf, dim);
 
-        readQuantized(cf, impl->tokEmbQ, (size_t)vocab * dim, gs);
-        readQuantized(cf, impl->wqQ, (size_t)layers * dim * (heads * headSize), gs);
-        readQuantized(cf, impl->wkQ, (size_t)layers * dim * (kvHeads * headSize), gs);
-        readQuantized(cf, impl->wvQ, (size_t)layers * dim * (kvHeads * headSize), gs);
-        readQuantized(cf, impl->woQ, (size_t)layers * (heads * headSize) * dim, gs);
-        readQuantized(cf, impl->w1Q, (size_t)layers * dim * hidden, gs);
-        readQuantized(cf, impl->w2Q, (size_t)layers * hidden * dim, gs);
-        readQuantized(cf, impl->w3Q, (size_t)layers * dim * hidden, gs);
-        if (!impl->sharedClassifier) readQuantized(cf, impl->wclsQ, (size_t)vocab * dim, gs);
+        readQuantized(cf, impl->tokEmbQ, (size_t)vocab * dim, 1, gs);
+        readQuantized(cf, impl->wqQ, (size_t)dim * (heads * headSize), layers, gs);
+        readQuantized(cf, impl->wkQ, (size_t)dim * (kvHeads * headSize), layers, gs);
+        readQuantized(cf, impl->wvQ, (size_t)dim * (kvHeads * headSize), layers, gs);
+        readQuantized(cf, impl->woQ, (size_t)(heads * headSize) * dim, layers, gs);
+        readQuantized(cf, impl->w1Q, (size_t)dim * hidden, layers, gs);
+        readQuantized(cf, impl->w2Q, (size_t)hidden * dim, layers, gs);
+        readQuantized(cf, impl->w3Q, (size_t)dim * hidden, layers, gs);
+        if (!impl->sharedClassifier) readQuantized(cf, impl->wclsQ, (size_t)vocab * dim, 1, gs);
 
         impl->tokEmbDequant = (float *)psram_alloc((size_t)vocab * dim * sizeof(float));
         if (impl->tokEmbDequant) dequantize(impl->tokEmbQ, impl->tokEmbDequant, (size_t)vocab * dim, gs);
