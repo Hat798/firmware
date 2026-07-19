@@ -89,7 +89,7 @@ constexpr int kDefaultSeedPresetIndex = kNumSeedPresets - 1; // "Random"
 // fake turn. On by default to match Chat2M.bin, the default recommended
 // model - plain story models (e.g. stories260K.bin) expect raw text instead.
 struct BruceLMSettings {
-    float temperature = 0.5f;
+    float temperature = 0.4f;
     float topP = 0.7f;
     float repetitionPenalty = 1.15f;
     int maxTokens = 128;
