@@ -118,14 +118,14 @@ void InputHandler(void) {
             t.x = tftWidth - t.x;
         }
         if (bruceConfigPins.rotation == 0) {
-            uint16_t tmp = t.x;
-            t.x = map((tftHeight + 20) - t.y, 0, 320, 0, 240);
-            t.y = map(tmp, 0, 240, 0, 320);
+            int tmp = t.x;
+            t.x = tftWidth - t.y;
+            t.y = tmp;
         }
         if (bruceConfigPins.rotation == 2) {
-            uint16_t tmp = t.x;
-            t.x = map(t.y, 0, 320, 0, 240);
-            t.y = map(tftWidth - tmp, 0, 240, 0, 320);
+            int tmp = t.x;
+            t.x = t.y;
+            t.y = (tftHeight + 20) - tmp;
         }
 
         Serial.printf("\nROT: Touch Pressed on x=%d, y=%d, rot=%d\n", t.x, t.y, bruceConfigPins.rotation);

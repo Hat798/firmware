@@ -68,7 +68,7 @@ static const uint8_t LP_TX = 11;
 
 /* TFT definitions */
 #define HAS_SCREEN 1
-#define ROTATION 1
+#define ROTATION 3
 #define MINBRIGHT (uint8_t)1
 #define USER_SETUP_LOADED 1
 /* ---------------------   */
